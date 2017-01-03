@@ -3,6 +3,11 @@ mx-lsoftmax
 
 mxnet version of [Large-Margin Softmax Loss for Convolutional Neural Networks][lsoftmax].
 
+forked from [luoyetx](https://github.com/luoyetx/mx-lsoftmax), good job :)
+
+## my changelog
+- 1)  add a little bit vectorization to python's implementation.(from 3800 -> 6800 samples/sec)
+
 ## Derivatives
 
 I put all formula I used to calculate the derivatives below. You can check it by yourself. If there's a mistake, please do tell me or open an issue.
