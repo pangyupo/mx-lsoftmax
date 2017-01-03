@@ -2,7 +2,7 @@ import os
 import math
 import mxnet as mx
 import numpy as np
-
+import time
 
 # MXNET_CPU_WORKER_NTHREADS must be greater than 1 for custom op to work on CPU
 os.environ['MXNET_CPU_WORKER_NTHREADS'] = '2'
@@ -21,7 +21,35 @@ class LSoftmaxOp(mx.operator.CustomOp):
         for i in range(margin+1):
             self.c_map.append(c_m_n(i, margin))
             self.k_map.append(math.cos(i * math.pi / margin))
+        
+        # save them in forward operation, used in backward 
+        self.k = None
+        self.cos_t = None
+        self.cos_mt = None
+        self.w_norm_choose = None
+        self.x_norm = None
+        self.w_choose = None
+    
+    def l2_norm_eachrow(self, input_data):
+        '''
+            compute norm of each row
+            2-dim matrix only
+        '''
+        out = mx.nd.sqrt(mx.nd.sum(mx.nd.square(input_data), axis=1))
+        return out
 
+    # reshape the array from (n,) -> (n,1) , damn it..
+    def expand_axis(self, arr):
+        return arr.reshape((arr.shape[0], 1))
+    
+    # adjust some var for broadcast, from (n,) to (n,1)
+    def adjust_var_shapes(self):
+        self.w_norm_choose = self.expand_axis(self.w_norm_choose)
+        self.x_norm = self.expand_axis(self.x_norm)
+        self.k = self.expand_axis(self.k)
+        self.cos_t = self.expand_axis(self.cos_t)
+        self.cos_mt = self.expand_axis(self.cos_mt)
+        
     def find_k(self, cos_t):
         '''find k for cos(theta)
         '''
@@ -34,14 +62,9 @@ class LSoftmaxOp(mx.operator.CustomOp):
         raise ValueError('can not find k for cos_t = %f'%cos_t)
 
     def calc_cos_mt(self, cos_t):
-        '''calculate cos(m*theta)
+        '''calculate cos(m*theta), u are so cute @luoyetx :)
         '''
-        cos_mt = 0
-        sin2_t = 1 - cos_t * cos_t
-        flag = -1
-        for p in range(self.margin / 2 + 1):
-            flag *= -1
-            cos_mt += flag * self.c_map[2*p] * pow(cos_t, self.margin-2*p) * pow(sin2_t, p)
+        cos_mt = math.cos(self.margin*math.acos(np.clip(cos_t, -1.0, 1.0)))
         return cos_mt
 
     def forward(self, is_train, req, in_data, out_data, aux):
@@ -49,27 +72,32 @@ class LSoftmaxOp(mx.operator.CustomOp):
         assert len(out_data) == 1
         assert len(req) == 1
         x, label, w = in_data
-        x = x.asnumpy()
-        w =  w.asnumpy()
-        label = label.asnumpy()
-        # original fully connected
-        out = x.dot(w.T)
-        # large margin fully connected
-        n = label.shape[0]
-        w_norm = np.linalg.norm(w, axis=1)
-        x_norm = np.linalg.norm(x, axis=1)
-        for i in range(n):
-            j = yi = int(label[i])
-            f = out[i, yi]
-            cos_t = f / (w_norm[yi] * x_norm[i])
-            # calc k and cos_mt
-            k = self.find_k(cos_t)
-            cos_mt = self.calc_cos_mt(cos_t)
-            # f_i_j = (\beta * f_i_j + fo_i_j) / (1 + \beta)
-            fo_i_j = f
-            f_i_j = (pow(-1, k) * cos_mt - 2*k) * (w_norm[yi] * x_norm[i])
-            out[i, yi] = (self.beta * f_i_j + fo_i_j) / (1 + self.beta)
-        self.assign(out_data[0], req[0], mx.nd.array(out))
+
+        out = mx.nd.dot(x, w.T)
+        w_norm = self.l2_norm_eachrow(w)
+        self.x_norm = self.l2_norm_eachrow(x)
+
+        self.w_norm_choose = w_norm.broadcast_to(shape=( label.shape[0], w_norm.shape[0]))
+        self.w_norm_choose = mx.nd.choose_element_0index(self.w_norm_choose, label)
+
+        f = mx.ndarray.choose_element_0index(out, label)
+        self.cos_t = f / (self.w_norm_choose * self.x_norm)
+        cos_t = self.cos_t.asnumpy()
+        
+        k = np.zeros_like(cos_t)
+        cos_mt = np.zeros_like(cos_t)
+        # how to apply selfdefined function to ndarray?
+        for i in range(label.shape[0]):
+            k[i] = self.find_k(cos_t[i])
+            cos_mt[i] = self.calc_cos_mt(cos_t[i])
+
+        # go back to gpu, is it ok with multiple gpu?
+        self.k = mx.nd.array(k, ctx=x.context)
+        self.cos_mt = mx.nd.array(cos_mt, ctx=x.context)
+
+        f_new = (mx.ndarray.power(-1, self.k) * self.cos_mt - 2*self.k) * (self.w_norm_choose*self.x_norm)
+        out = mx.nd.fill_element_0index(out, (self.beta*f_new+f)/(1+self.beta), label)
+        self.assign(out_data[0], req[0], out)
 
     def backward(self, req, out_grad, in_data, out_data, in_grad, aux):
         assert len(in_data) == 3
@@ -77,73 +105,66 @@ class LSoftmaxOp(mx.operator.CustomOp):
         assert len(in_grad) == 3
         assert len(req) == 3
         x, label, w = in_data
-        x = x.asnumpy()
-        w = w.asnumpy()
-        label = label.asnumpy()
-        o_grad = out_grad[0].asnumpy()
-        # original fully connected
-        x_grad = o_grad.dot(w)
-        w_grad = o_grad.T.dot(x)
-        # large margin fully connected
-        n = label.shape[0]  # batch size
-        m = w.shape[0]  # number of classes
-        margin = self.margin  # margin
-        feature_dim = w.shape[1]  # feature dimension
-        cos_t = np.zeros(n, dtype=np.float32)  # cos(theta)
-        cos_mt = np.zeros(n, dtype=np.float32)  # cos(margin * theta)
-        sin2_t = np.zeros(n, dtype=np.float32)  # sin(theta) ^ 2
-        fo = np.zeros(n, dtype=np.float32)  # fo_i = dot(x_i, w_yi)
-        k = np.zeros(n, dtype=np.int32)
-        x_norm = np.linalg.norm(x, axis=1)
-        w_norm = np.linalg.norm(w, axis=1)
-        for i in range(n):
-            j = yi = int(label[i])
-            f = w[yi].dot(x[i])
-            cos_t[i] = f / (w_norm[yi] * x_norm[i])
-            k[i] = self.find_k(cos_t[i])
-            cos_mt[i] = self.calc_cos_mt(cos_t[i])
-            sin2_t[i] = 1 - cos_t[i]*cos_t[i]
-            fo[i] = f
-        # gradient w.r.t. x_i
-        for i in range(n):
-            # df / dx at x = x_i, w = w_yi
-            j = yi = int(label[i])
-            dcos_dx = w[yi] / (w_norm[yi]*x_norm[i]) - x[i] * fo[i] / (w_norm[yi]*pow(x_norm[i], 3))
-            dsin2_dx = -2 * cos_t[i] * dcos_dx
-            dcosm_dx = margin*pow(cos_t[i], margin-1) * dcos_dx  # p = 0
-            flag = 1
-            for p in range(1, margin / 2 + 1):
-                flag *= -1
-                dcosm_dx += flag * self.c_map[2*p] * ( \
-                                p*pow(cos_t[i], margin-2*p)*pow(sin2_t[i], p-1)*dsin2_dx + \
-                                (margin-2*p)*pow(cos_t[i], margin-2*p-1)*pow(sin2_t[i], p)*dcos_dx)
-            df_dx = (pow(-1, k[i]) * cos_mt[i] - 2*k[i]) * w_norm[yi] / x_norm[i] * x[i] + \
-                     pow(-1, k[i]) * w_norm[yi] * x_norm[i] * dcosm_dx
-            alpha = self.beta / (1 + self.beta)
-            x_grad[i] += alpha * o_grad[i, yi] * (df_dx - w[yi])
-        # gradient w.r.t. w_j
-        for j in range(m):
-            dw = np.zeros(feature_dim, dtype=np.float32)
-            for i in range(n):
-                yi = int(label[i])
-                if yi == j:
-                    # df / dw at x = x_i, w = w_yi and yi == j
-                    dcos_dw = x[i] / (w_norm[yi]*x_norm[i]) - w[yi] * fo[i] / (x_norm[i]*pow(w_norm[yi], 3))
-                    dsin2_dw = -2 * cos_t[i] * dcos_dw
-                    dcosm_dw = margin*pow(cos_t[i], margin-1) * dcos_dw  # p = 0
-                    flag = 1
-                    for p in range(1, margin / 2 + 1):
-                        flag *= -1
-                        dcosm_dw += flag * self.c_map[2*p] * ( \
-                                        p*pow(cos_t[i], margin-2*p)*pow(sin2_t[i], p-1)*dsin2_dw + \
-                                        (margin-2*p)*pow(cos_t[i], margin-2*p-1)*pow(sin2_t[i], p)*dcos_dw)
-                    df_dw_j = (pow(-1, k[i]) * cos_mt[i] - 2*k[i]) * x_norm[i] / w_norm[yi] * w[yi] + \
-                               pow(-1, k[i]) * w_norm[yi] * x_norm[i] * dcosm_dw
-                    dw += o_grad[i, yi] * (df_dw_j - x[i])
-            alpha = self.beta / (1 + self.beta)
-            w_grad[j] += alpha * dw
-        self.assign(in_grad[0], req[0], mx.nd.array(x_grad))
-        self.assign(in_grad[2], req[2], mx.nd.array(w_grad))
+        n = label.shape[0]
+        margin = self.margin
+        o_grad = out_grad[0]
+        x_grad = mx.nd.dot(o_grad, w)
+        w_grad = mx.nd.dot(o_grad.T, x)
+
+        power = mx.nd.power # used a lot ...
+
+        # adjust shape for broadcast
+        self.adjust_var_shapes()
+        sin2_t = 1 - mx.nd.square(self.cos_t)
+
+        # allocate momory for the first time
+        if self.w_choose is None:
+            self.w_choose = x.copy()
+            self.w_choose[:] = 0
+        
+        # equivalence of mshadow's 'take' function here ? 
+        w_numpy = w.asnumpy()
+        self.w_choose = mx.nd.array(w_numpy[label.astype(np.int32).asnumpy(),:], ctx=x.context)
+        
+        # gradient wrt to x
+        dcos_dx = self.w_choose/(self.w_norm_choose*self.x_norm) - \
+                x*self.cos_t/(mx.nd.square(self.x_norm))
+        dsin2_dx = -2*self.cos_t*dcos_dx
+        dcosm_dx = margin*power(self.cos_t, margin-1)*dcos_dx # p == 0
+        
+        for p in range(1, margin/2 + 1):
+            dcosm_dx += pow(-1,p)*self.c_map[2*p]*( (margin-2*p)*power(self.cos_t, margin-2*p-1)*power(sin2_t, p)*dcos_dx + \
+                        p*power(sin2_t, p-1)*power(self.cos_t, margin-2*p)*dsin2_dx)
+        df_dx = (power(-1, self.k)*self.cos_mt - 2*self.k)*self.w_norm_choose/self.x_norm*x + \
+                self.w_norm_choose*self.x_norm*( power(-1,self.k)*dcosm_dx)
+        alpha = self.beta / (1 + self.beta)
+
+        grad_scale = mx.nd.choose_element_0index(o_grad, label)
+        x_grad += alpha*self.expand_axis(grad_scale)*(df_dx-self.w_choose)
+        
+        # gradient wrt to w
+        dcos_dw = x/(self.x_norm*self.w_norm_choose) - \
+                    self.w_choose*self.cos_t/(mx.nd.square(self.w_norm_choose))
+        dsin2_dw = -2*self.cos_t*dcos_dw
+        dcosm_dw = margin*power(self.cos_t, margin-1)*dcos_dw # p == 0
+        for p in range(1, margin/2 + 1):
+            dcosm_dw += pow(-1,p)*self.c_map[2*p]*((margin-2*p)*power(self.cos_t,margin-2*p-1)*power(sin2_t,p)*dcos_dw + \
+                       p*power(self.cos_t, margin-2*p)*power(sin2_t, p-1)*dsin2_dw)
+        
+        df_dw = (power(-1,self.k)*self.cos_mt-2*self.k)*self.x_norm/self.w_norm_choose*self.w_choose + \
+                power(-1,self.k)*self.x_norm*self.w_norm_choose*dcosm_dw
+
+        alpha = self.beta / (1 + self.beta)
+        grad_scale = mx.nd.choose_element_0index(o_grad,label)
+        df_dw = alpha*self.expand_axis(grad_scale)*(df_dw-x)
+        
+        # no take function ...damn, use numpy for the job
+        w_grad_numpy = w_grad.asnumpy()
+        w_grad_numpy[label.astype(np.int32).asnumpy()] += df_dw.asnumpy()
+        w_grad[:] = mx.nd.array(w_grad_numpy, ctx=x.context)
+
+        self.assign(in_grad[0], req[0], x_grad)
+        self.assign(in_grad[2], req[2], w_grad)
 
 
 @mx.operator.register("LSoftmax")
